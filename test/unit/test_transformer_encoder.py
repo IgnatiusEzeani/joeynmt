@@ -1,11 +1,11 @@
-from test.unit.test_helpers import TensorTestCase
+import unittest
 
 import torch
 
 from joeynmt.encoders import TransformerEncoder, TransformerEncoderLayer
 
 
-class TestTransformerEncoder(TensorTestCase):
+class TestTransformerEncoder(unittest.TestCase):
 
     def setUp(self):
         self.emb_size = 12
@@ -51,8 +51,9 @@ class TestTransformerEncoder(TensorTestCase):
 
         output, hidden = encoder(x, x_length, mask)
 
-        self.assertEqual(output.shape,
-                         torch.Size([batch_size, time_dim, self.hidden_size]))
+        self.assertEqual(
+            output.shape, torch.Size([batch_size, time_dim, self.hidden_size])
+        )
         self.assertEqual(hidden, None)
 
         output_target = torch.Tensor([
@@ -98,7 +99,7 @@ class TestTransformerEncoder(TensorTestCase):
                  -4.9189e-01, 2.4027e-02
              ]]
         ])
-        self.assertTensorAlmostEqual(output, output_target)
+        torch.testing.assert_close(output, output_target)
 
         for layer in encoder.layers:
             self.assertTrue(isinstance(layer, TransformerEncoderLayer))
@@ -106,9 +107,11 @@ class TestTransformerEncoder(TensorTestCase):
             self.assertTrue(hasattr(layer, "feed_forward"))
             self.assertEqual(layer.alpha, self.alpha)
             self.assertEqual(layer.size, self.hidden_size)
-            self.assertEqual(layer.feed_forward.pwff_layer[0].in_features,
-                             self.hidden_size)
-            self.assertEqual(layer.feed_forward.pwff_layer[0].out_features,
-                             self.ff_size)
+            self.assertEqual(
+                layer.feed_forward.pwff_layer[0].in_features, self.hidden_size
+            )
+            self.assertEqual(
+                layer.feed_forward.pwff_layer[0].out_features, self.ff_size
+            )
             # pylint: disable=protected-access
             self.assertEqual(layer._layer_norm_position, self.layer_norm)

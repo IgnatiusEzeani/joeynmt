@@ -1,5 +1,8 @@
 name: "wmt17_ende_bpe"
-joeynmt_version: "2.0.0"
+joeynmt_version: "2.3.0"
+model_dir: "models/wmt17_ende_bpe"
+use_cuda: True
+random_seed: 42
 
 data:
     train: "wmt17"
@@ -16,12 +19,13 @@ data:
         lowercase: False
         normalize: True
         level: "bpe"
+        voc_limit: 32000
         voc_min_freq: 1
-        voc_file: "test/data/subwords/wmt17_bpe.vocab"
+        voc_file: "subwords/wmt17_bpe.vocab"
         tokenizer_type: "subword-nmt"
         tokenizer_cfg:
             num_merges: 32000
-            codes: "test/data/subwords/wmt17_bpe.codes"
+            codes: "subwords/wmt17_bpe.codes"
             dropout: 0.1
             pretokenizer: "moses"
     trg:
@@ -32,15 +36,25 @@ data:
         level: "bpe"
         voc_limit: 32000
         voc_min_freq: 1
-        voc_file: "test/data/subwords/wmt17_bpe.vocab"
+        voc_file: "subwords/wmt17_bpe.vocab"
         tokenizer_type: "subword-nmt"
         tokenizer_cfg:
             num_merges: 32000
-            codes: "test/data/subwords/wmt17_bpe.codes"
+            codes: "subwords/wmt17_bpe.codes"
             dropout: 0.1
             pretokenizer: "moses"
+    special_symbols:
+        unk_token: "<unk>"
+        unk_id: 0
+        pad_token: "<pad>"
+        pad_id: 1
+        bos_token: "<s>"
+        bos_id: 2
+        eos_token: "</s>"
+        eos_id: 3
 
 testing:
+    load_model: "models/wmt17_ende_bpe/best.ckpt"
     n_best: 1
     beam_size: 5
     beam_alpha: 1.0
@@ -62,8 +76,7 @@ training:
     reset_scheduler: False
     reset_optimizer: False
     reset_iter_state: False
-    random_seed: 42
-    optimizer: "adam"
+    optimizer: "adamw"
     normalization: "tokens"
     adam_betas: [0.9, 0.98]
     scheduling: "warmupinversesquareroot"
@@ -81,16 +94,14 @@ training:
     updates: 100000
     validation_freq: 1000
     logging_freq: 100
-    model_dir: "models/wmt17_ende_bpe"
     overwrite: False
     shuffle: True
-    use_cuda: True
     print_valid_sents: [0, 1, 2, 3, 4]
     keep_best_ckpts: 5
 
 model:
-    initializer: "xavier_normal"
-    embed_initializer: "xavier_normal"
+    initializer: "xavier_uniform"
+    embed_initializer: "xavier_uniform"
     embed_init_gain: 1.0
     init_gain: 1.0
     bias_initializer: "zeros"
@@ -108,7 +119,8 @@ model:
         hidden_size: 512
         ff_size: 2048
         dropout: 0.1
-        layer_norm: "post"
+        layer_norm: "pre"
+        activation: "relu"
     decoder:
         type: "transformer"
         num_layers: 6
@@ -121,4 +133,5 @@ model:
         hidden_size: 512
         ff_size: 2048
         dropout: 0.1
-        layer_norm: "post"
+        layer_norm: "pre"
+        activation: "relu"

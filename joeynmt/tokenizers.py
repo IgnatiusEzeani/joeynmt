@@ -2,24 +2,25 @@
 """
 Tokenizer module
 """
-import logging
+import argparse
 import shutil
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Union
 
 import sentencepiece as sp
 from subword_nmt import apply_bpe
 
-from joeynmt.constants import BOS_TOKEN, EOS_TOKEN, PAD_TOKEN, UNK_TOKEN
-from joeynmt.helpers import ConfigurationError, remove_extra_spaces, unicode_normalize
+from joeynmt.config import ConfigurationError
+from joeynmt.helpers import remove_extra_spaces, unicode_normalize
+from joeynmt.helpers_for_ddp import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class BasicTokenizer:
+    # pylint: disable=too-many-instance-attributes
     SPACE = chr(32)  # ' ': half-width white space (ascii)
     SPACE_ESCAPE = chr(9601)  # '▁': sentencepiece default
-    SPECIALS = [BOS_TOKEN, EOS_TOKEN, PAD_TOKEN, UNK_TOKEN]
 
     def __init__(
         self,
@@ -47,8 +48,13 @@ class BasicTokenizer:
         if self.pretokenizer == "moses":
             try:
                 from sacremoses import (  # pylint: disable=import-outside-toplevel
-                    MosesTokenizer, MosesDetokenizer, MosesPunctNormalizer,
+                    MosesDetokenizer,
+                    MosesPunctNormalizer,
+                    MosesTokenizer,
                 )
+
+                # sacremoses package has to be installed.
+                # https://github.com/alvations/sacremoses
             except ImportError as e:
                 logger.error(e)
                 raise ImportError from e
@@ -59,13 +65,22 @@ class BasicTokenizer:
             if self.normalize:
                 self.moses_normalizer = MosesPunctNormalizer()
 
-    def pre_process(self, raw_input: str) -> str:
+    def pre_process(self, raw_input: str, allow_empty: bool = False) -> str:
         """
         Pre-process text
             - ex.) Lowercase, Normalize, Remove emojis,
                 Pre-tokenize(add extra white space before punc) etc.
             - applied for all inputs both in training and inference.
+
+        :param raw_input: raw input string
+        :param allow_empty: whether to allow empty string
+        :return: preprocessed input string
         """
+        if not allow_empty:
+            assert isinstance(raw_input, str) and raw_input.strip() != "", \
+                "The input sentence is empty! Please make sure " \
+                "that you are feeding a valid input."
+
         if self.normalize:
             raw_input = remove_extra_spaces(unicode_normalize(raw_input))
 
@@ -77,12 +92,16 @@ class BasicTokenizer:
         if self.lowercase:
             raw_input = raw_input.lower()
 
-        # ensure the string is not empty.
-        assert raw_input is not None and len(raw_input) > 0, raw_input
+        if not allow_empty:
+            # ensure the string is not empty.
+            assert raw_input is not None and len(raw_input) > 0, raw_input
         return raw_input
 
     def __call__(self, raw_input: str, is_train: bool = False) -> List[str]:
         """Tokenize single sentence"""
+        if raw_input is None:
+            return None
+
         if self.level == "word":
             sequence = raw_input.split(self.SPACE)
         elif self.level == "char":
@@ -102,40 +121,65 @@ class BasicTokenizer:
         return length > self.max_length > 0 or self.min_length > length > 0
 
     def _remove_special(self, sequence: List[str], generate_unk: bool = False):
-        specials = self.SPECIALS[:-1] if generate_unk else self.SPECIALS
-        return [token for token in sequence if token not in specials]
+        specials = self.specials if generate_unk else self.specials + [self.unk_token]
+        valid = [token for token in sequence if token not in specials]
+        if len(valid) == 0:  # if empty, return <unk>
+            valid = [self.unk_token]
+        return valid
 
-    def post_process(self, sequence: List[str], generate_unk: bool = True) -> str:
+    def post_process(
+        self,
+        sequence: Union[List[str], str],
+        generate_unk: bool = True,
+        cut_at_sep: bool = True
+    ) -> str:
         """Detokenize"""
-        sequence = self._remove_special(sequence, generate_unk=generate_unk)
-        if self.level == "word":
-            if self.pretokenizer == "moses":
-                detokenized = self.moses_detokenizer.detokenize(sequence)
-            else:
-                detokenized = self.SPACE.join(sequence)
-        elif self.level == "char":
-            detokenized = "".join(sequence).replace(self.SPACE_ESCAPE, self.SPACE)
+
+        if isinstance(sequence, list):
+            if cut_at_sep:
+                try:
+                    sep_pos = sequence.index(self.sep_token)  # cut off prompt
+                    sequence = sequence[sep_pos + 1:]
+
+                except ValueError as e:  # pylint: disable=unused-variable # noqa: F841
+                    pass
+            sequence = self._remove_special(sequence, generate_unk=generate_unk)
+            if self.level == "word":
+                if self.pretokenizer == "moses":
+                    sequence = self.moses_detokenizer.detokenize(sequence)
+                else:
+                    sequence = self.SPACE.join(sequence)
+            elif self.level == "char":
+                sequence = "".join(sequence).replace(self.SPACE_ESCAPE, self.SPACE)
 
         # Remove extra spaces
         if self.normalize:
-            detokenized = remove_extra_spaces(detokenized)
+            sequence = remove_extra_spaces(sequence)
 
         # ensure the string is not empty.
-        assert detokenized is not None and len(detokenized) > 0, detokenized
-        return detokenized
+        assert sequence is not None and len(sequence) > 0, sequence
+        return sequence
 
-    def set_vocab(self, itos: List[str]) -> None:
+    def set_vocab(self, vocab) -> None:
         """
         Set vocab
-        :param itos: (list) indices-to-symbols mapping
+        :param vocab: (Vocabulary)
         """
-        pass  # pylint: disable=unnecessary-pass
+        # pylint: disable=attribute-defined-outside-init
+        self.unk_token = vocab.specials[vocab.unk_index]
+        self.eos_token = vocab.specials[vocab.eos_index]
+        self.sep_token = vocab.specials[vocab.sep_index] if vocab.sep_index else None
+        specials = vocab.specials + vocab.lang_tags
+        self.specials = [token for token in specials if token != self.unk_token]
+        self.lang_tags = vocab.lang_tags
 
     def __repr__(self):
-        return (f"{self.__class__.__name__}(level={self.level}, "
-                f"lowercase={self.lowercase}, normalize={self.normalize}, "
-                f"filter_by_length=({self.min_length}, {self.max_length}), "
-                f"pretokenizer={self.pretokenizer})")
+        return (
+            f"{self.__class__.__name__}(level={self.level}, "
+            f"lowercase={self.lowercase}, normalize={self.normalize}, "
+            f"filter_by_length=({self.min_length}, {self.max_length}), "
+            f"pretokenizer={self.pretokenizer})"
+        )
 
 
 class SentencePieceTokenizer(BasicTokenizer):
@@ -163,6 +207,9 @@ class SentencePieceTokenizer(BasicTokenizer):
 
     def __call__(self, raw_input: str, is_train: bool = False) -> List[str]:
         """Tokenize"""
+        if raw_input is None:
+            return None
+
         if is_train and self.alpha > 0:
             tokenized = self.spm.sample_encode_as_pieces(
                 raw_input,
@@ -176,32 +223,45 @@ class SentencePieceTokenizer(BasicTokenizer):
             return None
         return tokenized
 
-    def post_process(self, sequence: List[str], generate_unk: bool = True) -> str:
+    def post_process(
+        self,
+        sequence: Union[List[str], str],
+        generate_unk: bool = True,
+        cut_at_sep: bool = True
+    ) -> str:
         """Detokenize"""
-        sequence = self._remove_special(sequence, generate_unk=generate_unk)
+        if isinstance(sequence, list):
+            if cut_at_sep:
+                try:
+                    sep_pos = sequence.index(self.sep_token)  # cut off prompt
+                    sequence = sequence[sep_pos:]
+                except ValueError as e:  # pylint: disable=unused-variable # noqa: F841
+                    pass
+            sequence = self._remove_special(sequence, generate_unk=generate_unk)
 
-        # Decode back to str
-        detokenized = self.spm.decode(sequence)
-        detokenized = detokenized.replace(self.SPACE_ESCAPE, self.SPACE).strip()
+            # Decode back to str
+            sequence = self.spm.decode(sequence)
+            sequence = sequence.replace(self.SPACE_ESCAPE, self.SPACE).strip()
 
         # Apply moses detokenizer
         if self.pretokenizer == "moses":
-            detokenized = self.moses_detokenizer.detokenize(detokenized.split())
+            sequence = self.moses_detokenizer.detokenize(sequence.split())
 
         # Remove extra spaces
         if self.normalize:
-            detokenized = remove_extra_spaces(detokenized)
+            sequence = remove_extra_spaces(sequence)
 
         # ensure the string is not empty.
-        assert detokenized is not None and len(detokenized) > 0, detokenized
-        return detokenized
+        assert sequence is not None and len(sequence) > 0, sequence
+        return sequence
 
-    def set_vocab(self, itos: List[str]) -> None:
+    def set_vocab(self, vocab) -> None:
         """Set vocab"""
-        self.spm.SetVocabulary(itos)
+        super().set_vocab(vocab)
+        self.spm.SetVocabulary(vocab._itos)  # pylint: disable=protected-access
 
     def copy_cfg_file(self, model_dir: Path) -> None:
-        """Copy confg file to model_dir"""
+        """Copy config file to model_dir"""
         if (model_dir / self.model_file.name).is_file():
             logger.warning(
                 "%s already exists. Stop copying.",
@@ -210,12 +270,14 @@ class SentencePieceTokenizer(BasicTokenizer):
         shutil.copy2(self.model_file, (model_dir / self.model_file.name).as_posix())
 
     def __repr__(self):
-        return (f"{self.__class__.__name__}(level={self.level}, "
-                f"lowercase={self.lowercase}, normalize={self.normalize}, "
-                f"filter_by_length=({self.min_length}, {self.max_length}), "
-                f"pretokenizer={self.pretokenizer}, "
-                f"tokenizer={self.spm.__class__.__name__}, "
-                f"nbest_size={self.nbest_size}, alpha={self.alpha})")
+        return (
+            f"{self.__class__.__name__}(level={self.level}, "
+            f"lowercase={self.lowercase}, normalize={self.normalize}, "
+            f"filter_by_length=({self.min_length}, {self.max_length}), "
+            f"pretokenizer={self.pretokenizer}, "
+            f"tokenizer={self.spm.__class__.__name__}, "
+            f"nbest_size={self.nbest_size}, alpha={self.alpha})"
+        )
 
 
 class SubwordNMTTokenizer(BasicTokenizer):
@@ -232,13 +294,19 @@ class SubwordNMTTokenizer(BasicTokenizer):
         super().__init__(level, lowercase, normalize, max_length, min_length, **kwargs)
         assert self.level == "bpe"
 
-        self.codes: Path = Path(kwargs["codes"])
-        assert self.codes.is_file(), f"codes file {self.codes} not found."
+        codes_file = Path(kwargs["codes"])
+        assert codes_file.is_file(), f"codes file {codes_file} not found."
 
         self.separator: str = kwargs.get("separator", "@@")
+        self.dropout: float = kwargs.get("dropout", 0.0)
+
         bpe_parser = apply_bpe.create_parser()
-        bpe_args = bpe_parser.parse_args(
-            ["--codes", kwargs["codes"], "--separator", self.separator])
+        for action in bpe_parser._actions:  # workaround to ensure utf8 encoding
+            if action.dest == "codes":
+                action.type = argparse.FileType('r', encoding='utf8')
+        bpe_args = bpe_parser.parse_args([
+            "--codes", codes_file.as_posix(), "--separator", self.separator
+        ])
         self.bpe = apply_bpe.BPE(
             bpe_args.codes,
             bpe_args.merges,
@@ -246,54 +314,73 @@ class SubwordNMTTokenizer(BasicTokenizer):
             None,
             bpe_args.glossaries,
         )
-        self.dropout: float = kwargs.get("dropout", 0.0)
+        self.codes: Path = codes_file
 
     def __call__(self, raw_input: str, is_train: bool = False) -> List[str]:
         """Tokenize"""
+        if raw_input is None:
+            return None
+
         dropout = self.dropout if is_train else 0.0
         tokenized = self.bpe.process_line(raw_input, dropout).strip().split()
         if is_train and self._filter_by_length(len(tokenized)):
             return None
         return tokenized
 
-    def post_process(self, sequence: List[str], generate_unk: bool = True) -> str:
+    def post_process(
+        self,
+        sequence: Union[List[str], str],
+        generate_unk: bool = True,
+        cut_at_sep: bool = True
+    ) -> str:
         """Detokenize"""
-        sequence = self._remove_special(sequence, generate_unk=generate_unk)
+        if isinstance(sequence, list):
+            if cut_at_sep:
+                try:
+                    sep_pos = sequence.index(self.sep_token)  # cut off prompt
+                    sequence = sequence[sep_pos:]
+                except ValueError as e:  # pylint: disable=unused-variable # noqa: F841
+                    pass
+            sequence = self._remove_special(sequence, generate_unk=generate_unk)
 
-        # Remove separators, join with spaces
-        detokenized = self.SPACE.join(sequence).replace(self.separator + self.SPACE, "")
-        # Remove final merge marker.
-        if detokenized.endswith(self.separator):
-            detokenized = detokenized[:-2]
+            # Remove separators, join with spaces
+            sequence = self.SPACE.join(sequence
+                                       ).replace(self.separator + self.SPACE, "")
+            # Remove final merge marker.
+            if sequence.endswith(self.separator):
+                sequence = sequence[:-len(self.separator)]
 
         # Moses detokenizer
         if self.pretokenizer == "moses":
-            detokenized = self.moses_detokenizer.detokenize(detokenized.split())
+            sequence = self.moses_detokenizer.detokenize(sequence.split())
 
         # Remove extra spaces
         if self.normalize:
-            detokenized = remove_extra_spaces(detokenized)
+            sequence = remove_extra_spaces(sequence)
 
         # ensure the string is not empty.
-        assert detokenized is not None and len(detokenized) > 0, detokenized
-        return detokenized
+        assert sequence is not None and len(sequence) > 0, sequence
+        return sequence
 
-    def set_vocab(self, itos: List[str]) -> None:
+    def set_vocab(self, vocab) -> None:
         """Set vocab"""
-        vocab = set(itos) - set(self.SPECIALS)
-        self.bpe.vocab = vocab
+        # pylint: disable=protected-access
+        super().set_vocab(vocab)
+        self.bpe.vocab = set(vocab._itos) - set(vocab.specials) - set(vocab.lang_tags)
 
     def copy_cfg_file(self, model_dir: Path) -> None:
-        """Copy confg file to model_dir"""
+        """Copy config file to model_dir"""
         shutil.copy2(self.codes, (model_dir / self.codes.name).as_posix())
 
     def __repr__(self):
-        return (f"{self.__class__.__name__}(level={self.level}, "
-                f"lowercase={self.lowercase}, normalize={self.normalize}, "
-                f"filter_by_length=({self.min_length}, {self.max_length}), "
-                f"pretokenizer={self.pretokenizer}, "
-                f"tokenizer={self.bpe.__class__.__name__}, "
-                f"separator={self.separator}, dropout={self.dropout})")
+        return (
+            f"{self.__class__.__name__}(level={self.level}, "
+            f"lowercase={self.lowercase}, normalize={self.normalize}, "
+            f"filter_by_length=({self.min_length}, {self.max_length}), "
+            f"pretokenizer={self.pretokenizer}, "
+            f"tokenizer={self.bpe.__class__.__name__}, "
+            f"separator={self.separator}, dropout={self.dropout})"
+        )
 
 
 def _build_tokenizer(cfg: Dict) -> BasicTokenizer:
@@ -337,18 +424,24 @@ def _build_tokenizer(cfg: Dict) -> BasicTokenizer:
                 **tokenizer_cfg,
             )
         else:
-            raise ConfigurationError(f"{tokenizer_type}: Unknown tokenizer type.")
+            raise ConfigurationError(
+                f"{tokenizer_type}: Unknown tokenizer type. "
+                "Valid options: {'sentencepiece', 'subword-nmt'}."
+            )
     else:
-        raise ConfigurationError(f"{cfg['level']}: Unknown tokenization level.")
+        raise ConfigurationError(
+            f"{cfg['level']}: Unknown tokenization level. "
+            "Valid options: {'word', 'bpe', 'char'}."
+        )
     return tokenizer
 
 
-def build_tokenizer(data_cfg: Dict) -> Dict[str, BasicTokenizer]:
-    src_lang = data_cfg["src"]["lang"]
-    trg_lang = data_cfg["trg"]["lang"]
+def build_tokenizer(cfg: Dict) -> Dict[str, BasicTokenizer]:
+    src_lang = cfg["src"]["lang"]
+    trg_lang = cfg["trg"]["lang"]
     tokenizer = {
-        src_lang: _build_tokenizer(data_cfg["src"]),
-        trg_lang: _build_tokenizer(data_cfg["trg"]),
+        src_lang: _build_tokenizer(cfg["src"]),
+        trg_lang: _build_tokenizer(cfg["trg"]),
     }
     logger.info("%s tokenizer: %s", src_lang, tokenizer[src_lang])
     logger.info("%s tokenizer: %s", trg_lang, tokenizer[trg_lang])

@@ -8,6 +8,8 @@ from typing import Optional
 import torch
 from torch import Tensor, nn
 
+from joeynmt.builders import build_activation
+
 
 class MultiHeadedAttention(nn.Module):
     """
@@ -71,7 +73,8 @@ class MultiHeadedAttention(nn.Module):
         v = self.v_layer(v)
         q = self.q_layer(q)
 
-        # reshape q, k, v for our computation to [batch_size, num_heads, ..]
+        # reshape q, k, v for our computation to
+        # [batch_size, num_heads, seq_len, head_dim]
         k = k.view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
         v = v.view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
         q = q.view(batch_size, -1, self.num_heads, self.head_size).transpose(1, 2)
@@ -95,14 +98,16 @@ class MultiHeadedAttention(nn.Module):
         # back to [batch_size, query_len, hidden_size]
         context = torch.matmul(attention_probs, v)
         context = context.transpose(1, 2).contiguous().view(
-            batch_size, -1, self.num_heads * self.head_size)
+            batch_size, -1, self.num_heads * self.head_size
+        )
 
         output = self.output_layer(context)
 
         if return_weights:
             # average attention weights over heads: [batch_size, query_len, key_len]
             attention_output_weights = attention_weights.view(
-                batch_size, self.num_heads, query_len, key_len)
+                batch_size, self.num_heads, query_len, key_len
+            )
             return output, attention_output_weights.sum(dim=1) / self.num_heads
         return output, None
 
@@ -120,6 +125,7 @@ class PositionwiseFeedForward(nn.Module):
         dropout: float = 0.1,
         alpha: float = 1.0,
         layer_norm: str = "post",
+        activation: str = "relu",
     ) -> None:
         """
         Initializes position-wise feed-forward layer.
@@ -128,13 +134,16 @@ class PositionwiseFeedForward(nn.Module):
         :param dropout: dropout probability
         :param alpha: weight factor for residual connection
         :param layer_norm: either "pre" or "post"
+        :param activation: activation function
         """
         super().__init__()
+
+        activation_fnc = build_activation(activation=activation)
 
         self.layer_norm = nn.LayerNorm(input_size, eps=1e-6)
         self.pwff_layer = nn.Sequential(
             nn.Linear(input_size, ff_size),
-            nn.ReLU(),
+            activation_fnc(),
             nn.Dropout(dropout),
             nn.Linear(ff_size, input_size),
             nn.Dropout(dropout),
@@ -175,14 +184,16 @@ class PositionalEncoding(nn.Module):
         """
         if size % 2 != 0:
             raise ValueError(
-                f"Cannot use sin/cos positional encoding with odd dim (got dim={size})")
+                f"Cannot use sin/cos positional encoding with odd dim (got dim={size})"
+            )
         pe = torch.zeros(max_len, size)
         position = torch.arange(0, max_len).unsqueeze(1)
         div_term = torch.exp(
-            (torch.arange(0, size, 2, dtype=torch.float) * -(math.log(10000.0) / size)))
+            (torch.arange(0, size, 2, dtype=torch.float) * -(math.log(10000.0) / size))
+        )
         pe[:, 0::2] = torch.sin(position.float() * div_term)
         pe[:, 1::2] = torch.cos(position.float() * div_term)
-        pe = pe.unsqueeze(0)  # shape: (1, size, max_len)
+        pe = pe.unsqueeze(0)  # shape: (1, max_len, size)
         super().__init__()
         self.register_buffer("pe", pe)
         self.dim = size
@@ -213,6 +224,7 @@ class TransformerEncoderLayer(nn.Module):
         dropout: float = 0.1,
         alpha: float = 1.0,
         layer_norm: str = "post",
+        activation: str = "relu",
     ) -> None:
         """
         A single Transformer encoder layer.
@@ -226,6 +238,7 @@ class TransformerEncoderLayer(nn.Module):
         :param dropout: dropout to apply to input
         :param alpha: weight factor for residual connection
         :param layer_norm: either "pre" or "post"
+        :param activation: activation function
         """
         super().__init__()
 
@@ -238,6 +251,7 @@ class TransformerEncoderLayer(nn.Module):
             dropout=dropout,
             alpha=alpha,
             layer_norm=layer_norm,
+            activation=activation,
         )
 
         self.dropout = nn.Dropout(dropout)
@@ -287,6 +301,7 @@ class TransformerDecoderLayer(nn.Module):
         dropout: float = 0.1,
         alpha: float = 1.0,
         layer_norm: str = "post",
+        activation: str = "relu",
     ) -> None:
         """
         Represents a single Transformer decoder layer.
@@ -301,6 +316,7 @@ class TransformerDecoderLayer(nn.Module):
         :param dropout: dropout to apply to input
         :param alpha: weight factor for residual connection
         :param layer_norm: either "pre" or "post"
+        :param activation: activation function
         """
         super().__init__()
         self.size = size
@@ -314,6 +330,7 @@ class TransformerDecoderLayer(nn.Module):
             dropout=dropout,
             alpha=alpha,
             layer_norm=layer_norm,
+            activation=activation,
         )
 
         self.x_layer_norm = nn.LayerNorm(size, eps=1e-6)
@@ -332,6 +349,7 @@ class TransformerDecoderLayer(nn.Module):
         src_mask: Tensor,
         trg_mask: Tensor,
         return_attention: bool = False,
+        **kwargs,
     ) -> Tensor:
         """
         Forward pass of a single Transformer decoder layer.
@@ -347,12 +365,13 @@ class TransformerDecoderLayer(nn.Module):
         :param x: inputs
         :param memory: source representations
         :param src_mask: source mask
-        :param trg_mask: target mask (so as to not condition on future steps)
+        :param trg_mask: target mask (so as not to condition on future steps)
         :param return_attention: whether to return the attention weights
         :return:
             - output tensor
             - attention weights
         """
+        # pylint: disable=unused-argument
         # 1. target-target self-attention
         residual = x
         if self._layer_norm_position == "pre":
@@ -369,11 +388,9 @@ class TransformerDecoderLayer(nn.Module):
         if self._layer_norm_position == "pre":
             h1 = self.dec_layer_norm(h1)
 
-        h2, att = self.src_trg_att(memory,
-                                   memory,
-                                   h1,
-                                   mask=src_mask,
-                                   return_weights=return_attention)
+        h2, att = self.src_trg_att(
+            memory, memory, h1, mask=src_mask, return_weights=return_attention
+        )
         h2 = self.dropout(h2) + self.alpha * h1_residual
 
         if self._layer_norm_position == "post":

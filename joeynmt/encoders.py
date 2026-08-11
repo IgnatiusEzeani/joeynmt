@@ -79,30 +79,31 @@ class RecurrentEncoder(Encoder):
         if freeze:
             freeze_params(self)
 
-    def _check_shapes_input_forward(self, embed_src: Tensor, src_length: Tensor,
-                                    mask: Tensor) -> None:
+    def _check_shapes_input_forward(
+        self, src_embed: Tensor, src_length: Tensor, mask: Tensor
+    ) -> None:
         """
         Make sure the shape of the inputs to `self.forward` are correct.
         Same input semantics as `self.forward`.
 
-        :param embed_src: embedded source tokens
+        :param src_embed: embedded source tokens
         :param src_length: source length
         :param mask: source mask
         """
         # pylint: disable=unused-argument
-        assert embed_src.shape[0] == src_length.shape[0]
-        assert embed_src.shape[2] == self.emb_size
-        # assert mask.shape == embed_src.shape
+        assert src_embed.shape[0] == src_length.shape[0]
+        assert src_embed.shape[2] == self.emb_size
+        # assert mask.shape == src_embed.shape
         assert len(src_length.shape) == 1
 
-    def forward(self, embed_src: Tensor, src_length: Tensor, mask: Tensor,
+    def forward(self, src_embed: Tensor, src_length: Tensor, mask: Tensor,
                 **kwargs) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Applies a bidirectional RNN to sequence of embeddings x.
         The input mini-batch x needs to be sorted by src length.
         x and mask should have the same dimensions [batch, time, dim].
 
-        :param embed_src: embedded src inputs,
+        :param src_embed: embedded src inputs,
             shape (batch_size, src_len, embed_size)
         :param src_length: length of src inputs
             (counting tokens before padding), shape (batch_size)
@@ -115,23 +116,23 @@ class RecurrentEncoder(Encoder):
             - hidden_concat: last hidden state with
                 shape (batch_size, directions*hidden)
         """
-        self._check_shapes_input_forward(embed_src=embed_src,
-                                         src_length=src_length,
-                                         mask=mask)
-        total_length = embed_src.size(1)
+        self._check_shapes_input_forward(
+            src_embed=src_embed, src_length=src_length, mask=mask
+        )
+        total_length = src_embed.size(1)
 
         # apply dropout to the rnn input
-        embed_src = self.emb_dropout(embed_src)
+        src_embed = self.emb_dropout(src_embed)
 
-        packed = pack_padded_sequence(embed_src, src_length.cpu(), batch_first=True)
+        packed = pack_padded_sequence(src_embed, src_length.cpu(), batch_first=True)
         output, hidden = self.rnn(packed)
 
         if isinstance(hidden, tuple):
             hidden, memory_cell = hidden  # pylint: disable=unused-variable
 
-        output, _ = pad_packed_sequence(output,
-                                        batch_first=True,
-                                        total_length=total_length)
+        output, _ = pad_packed_sequence(
+            output, batch_first=True, total_length=total_length
+        )
         # hidden: dir*layers x batch x hidden
         # output: batch x max_length x directions*hidden
         batch_size = hidden.size()[1]
@@ -204,22 +205,25 @@ class TransformerEncoder(Encoder):
                 num_heads=num_heads,
                 dropout=dropout,
                 alpha=kwargs.get("alpha", 1.0),
-                layer_norm=kwargs.get("layer_norm", "post"),
+                layer_norm=kwargs.get("layer_norm", "pre"),
+                activation=kwargs.get("activation", "relu"),
             ) for _ in range(num_layers)
         ])
 
         self.pe = PositionalEncoding(hidden_size)
         self.emb_dropout = nn.Dropout(p=emb_dropout)
 
-        self.layer_norm = (nn.LayerNorm(hidden_size, eps=1e-6) if kwargs.get(
-            "layer_norm", "post") == "pre" else None)
+        self.layer_norm = (
+            nn.LayerNorm(hidden_size, eps=1e-6)
+            if kwargs.get("layer_norm", "post") == "pre" else None
+        )
 
         if freeze:
             freeze_params(self)
 
     def forward(
         self,
-        embed_src: Tensor,
+        src_embed: Tensor,
         src_length: Tensor,  # unused
         mask: Tensor = None,
         **kwargs,
@@ -230,18 +234,21 @@ class TransformerEncoder(Encoder):
         The input mini-batch x needs to be sorted by src length.
         x and mask should have the same dimensions [batch, time, dim].
 
-        :param embed_src: embedded src inputs,
+        :param src_embed: embedded src inputs,
             shape (batch_size, src_len, embed_size)
         :param src_length: length of src inputs
             (counting tokens before padding), shape (batch_size)
         :param mask: indicates padding areas (zeros where padding), shape
             (batch_size, 1, src_len)
+        :param kwargs:
         :return:
             - output: hidden states with shape (batch_size, max_length, hidden)
             - None
         """
         # pylint: disable=unused-argument
-        x = self.pe(embed_src)  # add position encoding to word embeddings
+        x = self.pe(src_embed)  # add position encoding to word embeddings
+        if kwargs.get("src_prompt_mask", None) is not None:  # add src_prompt_mask
+            x = x + kwargs["src_prompt_mask"]
         x = self.emb_dropout(x)
 
         for layer in self.layers:
@@ -252,7 +259,10 @@ class TransformerEncoder(Encoder):
         return x, None
 
     def __repr__(self):
-        return (f"{self.__class__.__name__}(num_layers={len(self.layers)}, "
-                f"num_heads={self.layers[0].src_src_att.num_heads}, "
-                f"alpha={self.layers[0].alpha}, "
-                f'layer_norm="{self.layers[0]._layer_norm_position}")')
+        return (
+            f"{self.__class__.__name__}(num_layers={len(self.layers)}, "
+            f"num_heads={self.layers[0].src_src_att.num_heads}, "
+            f"alpha={self.layers[0].alpha}, "
+            f'layer_norm="{self.layers[0]._layer_norm_position}", '
+            f"activation={self.layers[0].feed_forward.pwff_layer[1]})"
+        )
